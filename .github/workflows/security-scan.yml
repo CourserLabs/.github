@@ -1,0 +1,79 @@
+# Reusable security gate for every CourserLabs repository.
+#
+#   jobs:
+#     security:
+#       uses: CourserLabs/.github/.github/workflows/security-scan.yml@main
+#
+# Free tooling that works on private repos without GitHub Advanced Security:
+#   gitleaks (secrets) · Semgrep CE (SAST) · osv-scanner (dependencies) · Trivy (vulns, secrets, IaC)
+# Third-party actions are pinned to commit SHAs; Renovate keeps them current.
+name: security-scan
+
+on:
+  workflow_call:
+    inputs:
+      semgrep-config:
+        description: Space-separated Semgrep rulesets.
+        type: string
+        default: p/default p/typescript p/nodejs p/secrets
+      trivy-skip-dirs:
+        description: Comma-separated directories Trivy should skip.
+        type: string
+        default: node_modules,dist,src/generated
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Secrets (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Install gitleaks (checksum-verified)
+        run: |
+          curl -sSfL -o gitleaks.tgz https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tgz" | sha256sum -c -
+          tar -xzf gitleaks.tgz gitleaks && rm gitleaks.tgz
+      - name: Scan commits
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # PRs: only the PR's commits. Pushes/schedules: full history.
+          args=(git --redact --verbose --exit-code 1)
+          if [ -n "$BASE" ]; then args+=("--log-opts=--no-merges $BASE..$HEAD"); fi
+          ./gitleaks "${args[@]}" .
+
+  semgrep:
+    name: SAST (Semgrep CE)
+    runs-on: ubuntu-latest
+    container:
+      image: semgrep/semgrep:1.182.0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Scan
+        env:
+          SEMGREP_RULES: ${{ inputs.semgrep-config }}
+        run: |
+          # Blocks on high-confidence (ERROR) findings only; everything else is reported.
+          semgrep scan --metrics=off --error --severity ERROR \
+            --exclude node_modules --exclude dist --exclude 'src/generated' \
+            $(for r in $SEMGREP_RULES; do printf -- '--config %s ' "$r"; done)
+
+  trivy:
+    name: Vulnerabilities, secrets & IaC (Trivy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          skip-dirs: ${{ inputs.trivy-skip-dirs }}
+          exit-code: '1'
